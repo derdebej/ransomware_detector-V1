@@ -13,6 +13,7 @@ import sys
 import signal
 import logging
 import datetime
+import threading
 
 import psutil
 
@@ -48,7 +49,58 @@ def setup_logging():
 
     logger.info("Logging initialised → %s", config.LOG_FILE)
 
+# response.py — add this helper above the ResponseHandler class
 
+# response.py — replace _find_pid_by_file_activity with this faster version
+
+def _find_pid_by_file_activity(watch_dirs):
+    """
+    Find ransomware process — first try by name match,
+    then fall back to open files scan.
+    """
+    watch_dirs_norm = [os.path.normpath(d).lower() for d in watch_dirs]
+
+    # Known attacker names — add your exe name here
+    SUSPECT_NAMES = {
+        'ransomware_sim.exe',
+        'simulate_ransomware.exe',
+        'cryptor.exe',
+        'encryptor.exe',
+    }
+
+    # Pass 1 — instant name match (works for demo with known exe)
+    for proc in psutil.process_iter(['pid', 'name']):
+        try:
+            if proc.info['name'].lower() in SUSPECT_NAMES:
+                return proc.info['pid'], proc.info['name']
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    # Pass 2 — find process with most watched-dir files open
+    suspects = {}
+    for proc in psutil.process_iter(['pid', 'name']):
+        try:
+            name = proc.info['name'].lower()
+            if name in {'system', 'svchost.exe', 'explorer.exe',
+                        'searchindexer.exe', 'registry', 'smss.exe',
+                        'csrss.exe', 'wininit.exe', 'services.exe',
+                        'lsass.exe', 'winlogon.exe'}:
+                continue
+            count = sum(
+                1 for f in (proc.open_files() or [])
+                if any(os.path.normpath(f.path).lower().startswith(d)
+                       for d in watch_dirs_norm)
+            )
+            if count > 0:
+                suspects[proc.info['pid']] = (proc.info['name'], count)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if not suspects:
+        return None, None
+
+    best_pid = max(suspects, key=lambda p: suspects[p][1])
+    return best_pid, suspects[best_pid][0]
 # ---------------------------------------------------------------------------
 # Response handler
 # ---------------------------------------------------------------------------
@@ -60,14 +112,32 @@ class ResponseHandler:
     not prevent the others from running.
     """
 
+    # response.py — update handle() method
+
+    # response.py — update handle() to be non-blocking
+
+    # response.py — replace handle() and _handle_async()
+
     def handle(self, alert: DetectionAlert):
-        self._log_alert(alert)
+        # Only log immediately, print after PID is found
+        threading.Thread(
+            target=self._handle_async,
+            args=(alert,),
+            daemon=True
+        ).start()
+
+    def _handle_async(self, alert: DetectionAlert):
+        if alert.offending_pid is None:
+            pid, name = _find_pid_by_file_activity(config.WATCH_DIRS)
+            if pid:
+                alert.offending_pid = pid
+                alert.offending_process = name
+        self._log_alert(alert)   # ← moved here
         self._print_alert(alert)
         if config.AUTO_KILL_PROCESS and alert.offending_pid is not None:
             self._kill_process(alert.offending_pid, alert.offending_process)
         if config.ALERT_SOUND:
             self._beep()
-
     # -----------------------------------------------------------------------
 
     @staticmethod

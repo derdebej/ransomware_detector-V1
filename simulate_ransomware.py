@@ -40,6 +40,8 @@ def _setup():
 
 
 def _cleanup():
+    print("[SIM] Waiting 2s before cleanup so detector can catch events...")
+    time.sleep(2.0)   # ← add this
     if os.path.isdir(SANDBOX_DIR):
         shutil.rmtree(SANDBOX_DIR)
     print("[SIM] Sandbox cleaned up.")
@@ -67,7 +69,7 @@ def _high_entropy_bytes(size=65536):
 # Simulation scenarios
 # ---------------------------------------------------------------------------
 
-def simulate_rapid_modifications(n=30, delay=0.05):
+def simulate_rapid_modifications(n=30, delay=0.2):
     """Rapidly modify many files → triggers Rule 1."""
     print(f"\n[SIM] ── Rapid Modifications ({n} files in ~{n*delay:.1f}s) ──")
     files = [_make_file() for _ in range(n)]
@@ -80,7 +82,7 @@ def simulate_rapid_modifications(n=30, delay=0.05):
     print(f"\n[SIM] Done — {n} files modified.")
 
 
-def simulate_suspicious_extensions(n=10, delay=0.1):
+def simulate_suspicious_extensions(n=10, delay=0.3):
     """Rename files to suspicious extensions → triggers Rules 2 & 3."""
     print(f"\n[SIM] ── Suspicious Extension Renames ({n} files) ──")
     files = [_make_file() for _ in range(n)]
@@ -104,7 +106,7 @@ def simulate_encrypted_files(n=5):
     print(f"[SIM] Done — {n} encrypted-looking files created.")
 
 
-def simulate_full_attack(delay=0.02):
+def simulate_full_attack(delay=0.1):
     """Combine all behaviours to trigger every rule."""
     print("\n[SIM] ══ FULL RANSOMWARE SIMULATION ══")
     simulate_rapid_modifications(n=25, delay=delay)

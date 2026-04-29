@@ -10,11 +10,18 @@ WATCH_DIRS = [
     os.path.join(HOME, "Documents"),
     os.path.join(HOME, "Desktop"),
     os.path.join(HOME, "Downloads"),
+]
+"""
+WATCH_DIRS = [
+    os.path.join(HOME, "Documents"),
+    os.path.join(HOME, "Desktop"),
+    os.path.join(HOME, "Downloads"),
     os.path.join(HOME, "Pictures"),
     os.path.join(HOME, "Videos"),
     os.path.join(HOME, "Music"),
     tempfile.gettempdir(),          # ← AJOUTÉ : %TEMP% / /tmp
 ]
+"""
 WATCH_DIRS = [d for d in WATCH_DIRS if os.path.isdir(d)]
 if not WATCH_DIRS:
     WATCH_DIRS = [HOME]
