@@ -52,5 +52,8 @@ PROTECTED_PROCESSES = {
 
 # Process EXE names that are immediately flagged as suspect (compiled simulators).
 SUSPECT_PROCESS_NAMES = {
-   
+    "ransomware_sim.exe", "simulate_ransomware.exe",
+    "sim_stealth.exe", "sim_inplace.exe",
+    "sim_multiprocess.exe", "sim_burst.exe",
+    "cryptor.exe", "encryptor.exe",
 }

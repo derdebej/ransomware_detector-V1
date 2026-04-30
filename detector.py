@@ -122,6 +122,12 @@ class Detector:
             else:
                 self._maybe_raise_alert(evt, triggered, evidence)
 
+    def refresh_stats(self):
+        """Re-compute rate counters from live windows — call from the UI thread
+        so the stats bar decays to 0 after an attack ends, instead of freezing."""
+        self.stats["mod_rate"]    = self._global_mod_window.count()
+        self.stats["rename_rate"] = self._global_rename_window.count()
+
     def _cached_entropy(self, path: str) -> float:
         now = time.time()
         cached = self._entropy_cache.get(path)

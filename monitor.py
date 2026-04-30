@@ -109,9 +109,21 @@ class ProcessTracker:
             self._full_scan()
             self._stop_evt.wait(timeout=2.0)
 
+    def _quick_register(self, pid: int):
+        """2 rapid re-registrations for every new process (100 ms apart).
+        Ensures _path_to_proc is populated within 200 ms for any EXE that
+        opens watched-dir files, regardless of whether it is a known suspect."""
+        for _ in range(2):
+            if self._stop_evt.is_set():
+                break
+            time.sleep(0.15)
+            try:
+                self._register_process(psutil.Process(pid))
+            except psutil.NoSuchProcess:
+                break
+
     def _aggressive_register(self, pid: int):
-        """Re-register a newly spotted suspect process every 100 ms for 1 s.
-        This ensures _path_to_proc is populated before the first file events arrive."""
+        """10 re-registrations for confirmed-suspect processes (100 ms apart, 1 s total)."""
         for _ in range(10):
             if self._stop_evt.is_set():
                 break
@@ -138,6 +150,15 @@ class ProcessTracker:
                             name = proc.name()
                             self._register_process(proc)
                             logger.debug("WMI: new process %s (PID %d) registered.", name, pid)
+
+                            # Quick re-registration for ALL new processes so that
+                            # _path_to_proc is populated even for EXEs not in
+                            # SUSPECT_PROCESS_NAMES.
+                            threading.Thread(
+                                target=self._quick_register,
+                                args=(pid,),
+                                daemon=True
+                            ).start()
 
                             if name.lower() in config.SUSPECT_PROCESS_NAMES:
                                 logger.info("WMI: SUSPECT EXE — %s (PID %d)", name, pid)

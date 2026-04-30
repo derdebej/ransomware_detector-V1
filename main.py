@@ -325,6 +325,7 @@ def run(auto_kill=True, quiet=False):
     # Stats bar refresh thread
     def stats_loop():
         while not stop_evt.is_set():
+            detector.refresh_stats()   # keep rate counters fresh even when queue is empty
             bar = format_stats_bar(detector.stats, monitor.queue_size, start_time)
             term_w = width()
             visible_len = len(_ANSI_ESCAPE.sub('', bar))
