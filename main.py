@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-import sys, os, time, signal, logging, argparse, threading, datetime, collections
+import re, sys, os, time, signal, logging, argparse, threading, datetime
+import ctypes
 import config
 from monitor import FileMonitor
 from detector import Detector
 from response import ResponseHandler, setup_logging
-# main.py — add after imports, before anything else
-
-import ctypes
-import subprocess
 
 def enable_ansi():
     """Enable ANSI/VT100 color codes on Windows Terminal."""
@@ -23,6 +20,33 @@ def enable_ansi():
             pass
 
 logger = logging.getLogger(__name__)
+
+_ANSI_ESCAPE = re.compile(r'\033\[[0-9;]*m')
+
+# Single lock that all threads must hold before writing to stdout.
+# Prevents alert boxes from interleaving with each other or the stats bar.
+_print_lock = threading.Lock()
+
+def _truncate_ansi(s: str, max_visible: int) -> str:
+    """Truncate s to at most max_visible printable characters, keeping ANSI codes intact."""
+    result = []
+    visible = 0
+    i = 0
+    while i < len(s):
+        if s[i] == '\033' and i + 1 < len(s) and s[i + 1] == '[':
+            j = i + 2
+            while j < len(s) and s[j] != 'm':
+                j += 1
+            result.append(s[i:j + 1])
+            i = j + 1
+        else:
+            if visible >= max_visible:
+                break
+            result.append(s[i])
+            visible += 1
+            i += 1
+    result.append('\033[0m')
+    return ''.join(result)
 
 # ---------------------------------------------------------------------------
 # Terminal color/style constants (Windows Terminal / ANSI)
@@ -89,7 +113,7 @@ def print_info_box(dirs, auto_kill, log_file):
     kill_str = f"{GREEN}ENABLED{R}" if auto_kill else f"{YELLOW}DISABLED{R}"
     print(f"  {CYAN}◈ {WHITE}Auto-kill{R}  {kill_str}")
     print(f"  {CYAN}◈ {WHITE}Log file{R}   {LGRAY}{log_file}{R}")
-    print(f"  {CYAN}◈ {WHITE}Engine{R}     {LGRAY}4 rules  ·  no AI  ·  no signatures{R}")
+    print(f"  {CYAN}◈ {WHITE}Engine{R}     {LGRAY}5 rules  ·  no AI  ·  no signatures{R}")
     print(bar)
     print()
 
@@ -139,6 +163,7 @@ RULE_ICONS = {
     "RAPID_RENAMES":        "🔄",
     "SUSPICIOUS_EXTENSION": "🎯",
     "HIGH_ENTROPY":         "🔐",
+    "SUSPECT_PROCESS":      "🦠",
 }
 
 def print_alert_box(alert):
@@ -148,11 +173,7 @@ def print_alert_box(alert):
     pad = w - 2
 
     def row(content=""):
-        content_clean = content
-        # strip ANSI for length calc
-        import re
-        ansi_escape = re.compile(r'\033\[[0-9;]*m')
-        visible = ansi_escape.sub('', content)
+        visible = _ANSI_ESCAPE.sub('', content)
         spaces = pad - len(visible)
         return f"{GRAY}║{R}{content}{' ' * max(0, spaces)}{GRAY}║{R}"
 
@@ -199,48 +220,70 @@ class PrettyResponseHandler(_RH):
         ).start()
 
     def _handle_async(self, alert):
+        import psutil
+
         if alert.offending_pid is None:
             pid, name = _find_pid_by_file_activity(config.WATCH_DIRS)
             if pid:
-                alert.offending_pid  = pid
+                alert.offending_pid     = pid
                 alert.offending_process = name
 
         self._log_alert(alert)
-        print_alert_box(alert)
+        with _print_lock:
+            sys.stdout.write("\n")   # step off the stats bar line before the box
+            print_alert_box(alert)
 
-        if config.AUTO_KILL_PROCESS and alert.offending_pid is not None:
-            import psutil
+        if not (config.AUTO_KILL_PROCESS and alert.offending_pid is not None):
+            return
+
+        # Hunt loop — kill the triggering process, then immediately look for any
+        # remaining co-workers (handles multi-process attacks where killing the
+        # coordinator leaves workers still running).
+        killed_pids = set()
+        target_pid  = alert.offending_pid
+
+        for _ in range(10):           # cap at 10 kills per alert to avoid infinite loops
+            if target_pid in killed_pids:
+                break
             try:
-                proc = psutil.Process(alert.offending_pid)
+                proc      = psutil.Process(target_pid)
                 proc_name = proc.name()
-                PROTECTED = {
-                    "systemd","init","kthreadd","sshd","bash",
-                    "python","python3","explorer.exe","winlogon.exe",
-                    "services.exe","lsass.exe",
-                }
-                if proc_name.lower() not in PROTECTED:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except psutil.TimeoutExpired:
-                        proc.kill()
-                    logger.warning("Killed process %s (PID %d)", proc_name, alert.offending_pid)
-                    print_kill_line(proc_name, alert.offending_pid, True)
+                if proc_name.lower() in config.PROTECTED_PROCESSES:
+                    break
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                logger.warning("Killed process %s (PID %d)", proc_name, target_pid)
+                with _print_lock:
+                    print_kill_line(proc_name, target_pid, True)
+                killed_pids.add(target_pid)
             except psutil.NoSuchProcess:
-                print_kill_line(
-                    alert.offending_process or "?", alert.offending_pid, False
-                )
+                with _print_lock:
+                    print_kill_line(alert.offending_process or "?", target_pid, False)
+                killed_pids.add(target_pid)
             except psutil.AccessDenied:
-                print(f"  {RED}❌  Cannot kill PID {alert.offending_pid}: permission denied.{R}\n")
+                with _print_lock:
+                    print(f"  {RED}❌  Cannot kill PID {target_pid}: permission denied.{R}\n")
+                break
             except Exception as exc:
                 logger.error("Kill error: %s", exc)
+                break
+
+            # Look for remaining suspects (co-workers) immediately after each kill
+            time.sleep(0.3)
+            next_pid, next_name = _find_pid_by_file_activity(config.WATCH_DIRS)
+            if next_pid is None or next_pid in killed_pids:
+                break
+            target_pid = next_pid
 
 # ---------------------------------------------------------------------------
 # Main run loop
 # ---------------------------------------------------------------------------
 
 def run(auto_kill=True, quiet=False):
-    enable_ansi()   # ← add this as first line
+    enable_ansi()
     config.AUTO_KILL_PROCESS = auto_kill
 
     print_banner()
@@ -251,6 +294,23 @@ def run(auto_kill=True, quiet=False):
     response = PrettyResponseHandler()
     detector = Detector(alert_callback=response.handle)
     monitor  = FileMonitor()
+
+    # Immediate-kill path for known-bad EXEs — fires from WMI thread,
+    # bypasses queue so kills work even when backlog is hundreds of events.
+    def _immediate_suspect_kill(pid: int, name: str):
+        import time as _time
+        from detector import DetectionAlert as _DA
+        alert = _DA(
+            timestamp=_time.time(),
+            triggered_rules=["SUSPECT_PROCESS"],
+            offending_pid=pid,
+            offending_process=name,
+            evidence={"SUSPECT_PROCESS": f"Known malware EXE: {name}"},
+            severity="HIGH",
+        )
+        response.handle(alert)
+
+    monitor.immediate_alert_cb = _immediate_suspect_kill
     monitor.start()
 
     print(f"  {GREEN}{BOLD}✅  Ready — monitoring active.{R}\n")
@@ -266,9 +326,14 @@ def run(auto_kill=True, quiet=False):
     def stats_loop():
         while not stop_evt.is_set():
             bar = format_stats_bar(detector.stats, monitor.queue_size, start_time)
-            # Clear entire line then reprint
-            sys.stdout.write(f"\033[2K\r{bar}")
-            sys.stdout.flush()
+            term_w = width()
+            visible_len = len(_ANSI_ESCAPE.sub('', bar))
+            if visible_len > term_w:
+                bar = _truncate_ansi(bar, term_w)
+                visible_len = term_w
+            with _print_lock:
+                sys.stdout.write(f"\r{bar}{' ' * (term_w - visible_len)}")
+                sys.stdout.flush()
             time.sleep(1.0)
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -285,7 +350,7 @@ def run(auto_kill=True, quiet=False):
     # Main event loop — batch drain
     while not stop_evt.is_set():
         processed = 0
-        while processed < 100:
+        while processed < 500:
             evt = monitor.get_event(timeout=0.01)
             if evt is None:
                 break

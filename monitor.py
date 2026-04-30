@@ -53,6 +53,7 @@ class ProcessTracker:
         self._path_to_proc: dict = {}
         self._lock        = threading.Lock()
         self._stop_evt    = threading.Event()
+        self._on_suspect  = None   # optional callback(pid, name) for known-bad EXEs
         self._wmi_thread  = threading.Thread(
             target=self._wmi_loop, daemon=True, name="wmi-tracker"
         )
@@ -108,12 +109,22 @@ class ProcessTracker:
             self._full_scan()
             self._stop_evt.wait(timeout=2.0)
 
-    # monitor.py — replace _wmi_loop method
+    def _aggressive_register(self, pid: int):
+        """Re-register a newly spotted suspect process every 100 ms for 1 s.
+        This ensures _path_to_proc is populated before the first file events arrive."""
+        for _ in range(10):
+            if self._stop_evt.is_set():
+                break
+            time.sleep(0.1)
+            try:
+                self._register_process(psutil.Process(pid))
+            except psutil.NoSuchProcess:
+                break
 
     def _wmi_loop(self):
         try:
             import pythoncom
-            pythoncom.CoInitialize()  # ← required for WMI in threads
+            pythoncom.CoInitialize()
             w = wmi.WMI()
             watcher = w.Win32_ProcessStartTrace.watch_for()
             while not self._stop_evt.is_set():
@@ -121,12 +132,22 @@ class ProcessTracker:
                     event = watcher(timeout_ms=1000)
                     if event:
                         pid = event.ProcessID
-                        time.sleep(0.1)
+                        time.sleep(0.05)
                         try:
                             proc = psutil.Process(pid)
+                            name = proc.name()
                             self._register_process(proc)
-                            logger.debug("WMI: new process %s (PID %d) registered.",
-                                        proc.name(), pid)
+                            logger.debug("WMI: new process %s (PID %d) registered.", name, pid)
+
+                            if name.lower() in config.SUSPECT_PROCESS_NAMES:
+                                logger.info("WMI: SUSPECT EXE — %s (PID %d)", name, pid)
+                                if self._on_suspect:
+                                    self._on_suspect(pid, name)
+                                threading.Thread(
+                                    target=self._aggressive_register,
+                                    args=(pid,),
+                                    daemon=True
+                                ).start()
                         except psutil.NoSuchProcess:
                             pass
                 except wmi.x_wmi_timed_out:
@@ -153,6 +174,12 @@ class _Handler(FileSystemEventHandler):
         self._tracker = tracker
 
     def _push(self, evt: FileEvent):
+        # Ignore events from excluded directories (e.g. the project folder itself)
+        if evt.src_path:
+            path = os.path.normpath(evt.src_path)
+            for excl in config.EXCLUDE_DIRS:
+                if path.startswith(excl):
+                    return
         try:
             self._queue.put_nowait(evt)
         except queue.Full:
@@ -203,8 +230,36 @@ class FileMonitor:
     def __init__(self):
         self._queue    = queue.Queue(maxsize=50_000)
         self._tracker  = ProcessTracker(config.WATCH_DIRS)
+        self._tracker._on_suspect = self._on_suspect_process
         self._observer = Observer()
         self._running  = False
+        # Set by main.py — called directly from WMI thread, bypasses queue backlog
+        self.immediate_alert_cb = None
+
+    def _on_suspect_process(self, pid: int, name: str):
+        """Called from WMI thread when a known-bad EXE is detected.
+
+        Always injects a synthetic event for the detector pipeline.
+        Also fires immediate_alert_cb directly so kills happen even when
+        the queue is saturated (queue-bypass path).
+        """
+        evt = FileEvent(
+            event_type="process_detected",
+            src_path="",
+            pid=pid,
+            process_name=name,
+        )
+        try:
+            self._queue.put_nowait(evt)
+        except queue.Full:
+            pass
+
+        if self.immediate_alert_cb:
+            threading.Thread(
+                target=self.immediate_alert_cb,
+                args=(pid, name),
+                daemon=True,
+            ).start()
 
     def start(self):
         if self._running:

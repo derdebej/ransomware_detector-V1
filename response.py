@@ -1,16 +1,9 @@
 # =============================================================================
 # response.py — Automated response to ransomware detection alerts
-#
-# Actions (in order):
-#   1. Log the alert to file (always)
-#   2. Print a prominent console alert
-#   3. Kill the offending process (if AUTO_KILL_PROCESS is True)
-#   4. Optional: sound alert
 # =============================================================================
 
 import os
 import sys
-import signal
 import logging
 import datetime
 import threading
@@ -28,63 +21,78 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def setup_logging():
-    """Configure root logger to write to both console and log file."""
-    fmt = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+    fmt = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # Console handler (INFO and above)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter(fmt, datefmt))
-    root.addHandler(ch)
-
-    # File handler (DEBUG and above — full audit trail)
+    # File handler only — console output is handled by the pretty TUI.
+    # A console StreamHandler would interleave with the stats bar.
     fh = logging.FileHandler(config.LOG_FILE, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
     root.addHandler(fh)
 
-    logger.info("Logging initialised → %s", config.LOG_FILE)
-
-# response.py — add this helper above the ResponseHandler class
-
-# response.py — replace _find_pid_by_file_activity with this faster version
 
 def _find_pid_by_file_activity(watch_dirs):
     """
-    Find ransomware process — first try by name match,
-    then fall back to open files scan.
+    Find the ransomware process using three passes in order of speed:
+      1. EXE name match       -- compiled simulators / known malware names
+      2. Command-line match   -- Python-run scripts (files closed before open-file scan)
+      3. Open-files heuristic -- unknown process with most watched-dir files open
     """
     watch_dirs_norm = [os.path.normpath(d).lower() for d in watch_dirs]
 
-    # Known attacker names — add your exe name here
-    SUSPECT_NAMES = {
-        'ransomware_sim.exe',
-        'simulate_ransomware.exe',
-        'cryptor.exe',
-        'encryptor.exe',
-    }
-
-    # Pass 1 — instant name match (works for demo with known exe)
+    # Pass 1 -- instant EXE name match
     for proc in psutil.process_iter(['pid', 'name']):
         try:
-            if proc.info['name'].lower() in SUSPECT_NAMES:
+            if proc.info['name'].lower() in config.SUSPECT_PROCESS_NAMES:
                 return proc.info['pid'], proc.info['name']
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
-    # Pass 2 — find process with most watched-dir files open
+    # Constants shared by Pass 2 and Pass 3.
+    OWN_PID      = os.getpid()
+    PYTHON_NAMES = {'python.exe', 'python3.exe', 'python', 'python3'}
+    SAFE_SCRIPTS = {'main.py'}
+
+    # Pass 2 -- generic Python-process detection.
+    # Python scripts open and close files too fast for open-file scanning, but
+    # the script name is always visible in the process argv. We flag any
+    # python.exe that is not the detector's own process and is not running
+    # main.py (the detector entry point). This works for any simulator script
+    # without requiring its name to be hardcoded anywhere.
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            if proc.info['pid'] == OWN_PID:
+                continue
+            if proc.info['name'].lower() not in PYTHON_NAMES:
+                continue
+            cmdline = proc.info.get('cmdline') or []
+            scripts = {os.path.basename(a).lower() for a in cmdline if a.endswith('.py')}
+            if scripts and scripts.issubset(SAFE_SCRIPTS):
+                continue
+            if scripts:
+                script_name  = next(iter(scripts))
+                display_name = f"{proc.info['name']} [{script_name}]"
+                return proc.info['pid'], display_name
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    # Pass 3 -- unknown process: pick the one with most watched-dir files open.
+    # Explicitly excludes the detector's own PID and all Python interpreters
+    # (Python processes are handled by Pass 2; if Pass 2 didn't find one it
+    # means no suspicious .py script is running, so don't kill python.exe here).
+    SKIP = {'system', 'svchost.exe', 'explorer.exe', 'searchindexer.exe',
+            'registry', 'smss.exe', 'csrss.exe', 'wininit.exe',
+            'services.exe', 'lsass.exe', 'winlogon.exe'} | PYTHON_NAMES
     suspects = {}
     for proc in psutil.process_iter(['pid', 'name']):
         try:
-            name = proc.info['name'].lower()
-            if name in {'system', 'svchost.exe', 'explorer.exe',
-                        'searchindexer.exe', 'registry', 'smss.exe',
-                        'csrss.exe', 'wininit.exe', 'services.exe',
-                        'lsass.exe', 'winlogon.exe'}:
+            if proc.info['pid'] == OWN_PID:
+                continue
+            if proc.info['name'].lower() in SKIP:
                 continue
             count = sum(
                 1 for f in (proc.open_files() or [])
@@ -101,25 +109,14 @@ def _find_pid_by_file_activity(watch_dirs):
 
     best_pid = max(suspects, key=lambda p: suspects[p][1])
     return best_pid, suspects[best_pid][0]
+
+
 # ---------------------------------------------------------------------------
 # Response handler
 # ---------------------------------------------------------------------------
 
 class ResponseHandler:
-    """
-    Receives a DetectionAlert and executes the response playbook.
-    All methods are intentionally defensive — a failure in one step must
-    not prevent the others from running.
-    """
-
-    # response.py — update handle() method
-
-    # response.py — update handle() to be non-blocking
-
-    # response.py — replace handle() and _handle_async()
-
     def handle(self, alert: DetectionAlert):
-        # Only log immediately, print after PID is found
         threading.Thread(
             target=self._handle_async,
             args=(alert,),
@@ -132,20 +129,16 @@ class ResponseHandler:
             if pid:
                 alert.offending_pid = pid
                 alert.offending_process = name
-        self._log_alert(alert)   # ← moved here
-        self._print_alert(alert)
-        if config.AUTO_KILL_PROCESS and alert.offending_pid is not None:
-            self._kill_process(alert.offending_pid, alert.offending_process)
+        self._log_alert(alert)
         if config.ALERT_SOUND:
             self._beep()
-    # -----------------------------------------------------------------------
 
     @staticmethod
     def _log_alert(alert: DetectionAlert):
         ts = datetime.datetime.fromtimestamp(alert.timestamp).strftime("%Y-%m-%d %H:%M:%S")
         lines = [
             "=" * 70,
-            f"  ⚠  RANSOMWARE DETECTED — {ts}  [{alert.severity}]",
+            f"  WARNING  RANSOMWARE DETECTED -- {ts}  [{alert.severity}]",
             f"  Process : {alert.offending_process or 'unknown'}  (PID {alert.offending_pid})",
             f"  Rules   : {', '.join(alert.triggered_rules)}",
             "  Evidence:",
@@ -153,73 +146,10 @@ class ResponseHandler:
         for rule, detail in alert.evidence.items():
             lines.append(f"    [{rule}] {detail}")
         lines.append("=" * 70)
-        block = "\n".join(lines)
-        logger.warning("\n%s", block)
-
-    @staticmethod
-    def _print_alert(alert: DetectionAlert):
-        RED   = "\033[91m"
-        BOLD  = "\033[1m"
-        RESET = "\033[0m"
-        ts = datetime.datetime.fromtimestamp(alert.timestamp).strftime("%H:%M:%S")
-
-        print(f"\n{RED}{BOLD}")
-        print("╔══════════════════════════════════════════════════════════════════╗")
-        print(f"║  🚨  RANSOMWARE DETECTED [{alert.severity}]  —  {ts}              ║")
-        print("╠══════════════════════════════════════════════════════════════════╣")
-        proc = alert.offending_process or "unknown"
-        print(f"║  Process : {proc:<20}  PID : {str(alert.offending_pid):<10}        ║")
-        print(f"║  Rules   : {', '.join(alert.triggered_rules):<54}  ║")
-        print("╠══════════════════════════════════════════════════════════════════╣")
-        for rule, detail in alert.evidence.items():
-            # Truncate detail to fit console width
-            short = detail[:58] if len(detail) > 58 else detail
-            print(f"║  {rule:<20} {short:<44}  ║")
-        print("╚══════════════════════════════════════════════════════════════════╝")
-        print(f"{RESET}")
-
-    @staticmethod
-    def _kill_process(pid: int, name: str):
-        try:
-            proc = psutil.Process(pid)
-            proc_name = proc.name()
-
-            # Safety guard — never kill system-critical processes
-            PROTECTED = {
-                "systemd", "init", "kthreadd", "sshd", "bash",
-                "python", "python3", "explorer.exe", "winlogon.exe",
-                "services.exe", "lsass.exe",
-            }
-            if proc_name.lower() in PROTECTED:
-                logger.warning(
-                    "Refusing to kill protected process %s (PID %d)", proc_name, pid
-                )
-                return
-
-            proc.terminate()          # SIGTERM first (graceful)
-            try:
-                proc.wait(timeout=3)
-            except psutil.TimeoutExpired:
-                proc.kill()           # SIGKILL if still alive
-
-            logger.warning("Killed process %s (PID %d)", proc_name, pid)
-            print(f"  ✅  Process '{proc_name}' (PID {pid}) has been terminated.")
-
-        except psutil.NoSuchProcess:
-            logger.info("Process PID %d already gone.", pid)
-        except psutil.AccessDenied:
-            logger.error(
-                "Access denied — cannot kill PID %d. "
-                "Try running as root/Administrator.",
-                pid,
-            )
-            print(f"  ❌  Cannot kill PID {pid}: permission denied (try sudo).")
-        except Exception as exc:
-            logger.error("Unexpected error killing PID %d: %s", pid, exc)
+        logger.warning("\n%s", "\n".join(lines))
 
     @staticmethod
     def _beep():
-        """Cross-platform beep."""
         try:
             if sys.platform == "win32":
                 import winsound

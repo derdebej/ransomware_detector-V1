@@ -62,7 +62,7 @@ def _make_file(name=None, content=None, subdir=None):
 
 def _high_entropy_bytes(size=65536):
     """Return bytes that look like encrypted data (high Shannon entropy)."""
-    return bytes([random.randint(0, 255) for _ in range(size)])
+    return os.urandom(size)
 
 
 # ---------------------------------------------------------------------------

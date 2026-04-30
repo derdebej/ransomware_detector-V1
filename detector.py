@@ -27,8 +27,9 @@ class DetectionAlert:
 
 
 class EventWindow:
-    def __init__(self, window_seconds: float):
+    def __init__(self, window_seconds: float, unique: bool = False):
         self._window = window_seconds
+        self._unique = unique   # if True, count distinct values instead of total events
         self._items: collections.deque = collections.deque()
 
     def add(self, value):
@@ -46,6 +47,8 @@ class EventWindow:
 
     def count(self):
         self._expire()
+        if self._unique:
+            return len({v for _, v in self._items})
         return len(self._items)
 
     def clear(self):
@@ -74,12 +77,15 @@ def file_entropy(path: str, sample_bytes: int = config.ENTROPY_SAMPLE_BYTES) -> 
 
 
 class Detector:
+    _ENTROPY_CACHE_TTL = 2.0   # seconds — prevents re-reading same file on 3+ watchdog events
+
     def __init__(self, alert_callback=None):
         self._alert_cb = alert_callback
-        self._global_mod_window    = EventWindow(config.MOD_TIME_WINDOW)
+        self._global_mod_window    = EventWindow(config.MOD_TIME_WINDOW, unique=True)
         self._global_rename_window = EventWindow(config.RENAME_TIME_WINDOW)
         self._alerted_pids: Dict   = {}
-        self._alert_cooldown       = 5.0    # BUG FIX 6 : reduit de 30s a 5s
+        self._alert_cooldown       = 5.0
+        self._entropy_cache: Dict  = {}   # path → (timestamp, entropy)
 
         self.stats = {
             "total_events":  0,
@@ -107,7 +113,25 @@ class Detector:
             logger.debug("Rules triggered: %s for %s", triggered, evt.src_path)
 
         if len(triggered) >= config.MIN_RULES_FOR_ALERT:
-            self._maybe_raise_alert(evt, triggered, evidence)
+            # Synthetic process_detected events: update cooldown without re-alerting
+            # so the immediate-kill path's duplicate doesn't fire again.
+            if evt.event_type == "process_detected":
+                key = tuple(sorted(triggered))
+                self._alerted_pids[key] = time.time()
+                self.stats["alerts_raised"] += 1
+            else:
+                self._maybe_raise_alert(evt, triggered, evidence)
+
+    def _cached_entropy(self, path: str) -> float:
+        now = time.time()
+        cached = self._entropy_cache.get(path)
+        if cached and now - cached[0] < self._ENTROPY_CACHE_TTL:
+            return cached[1]
+        val = file_entropy(path)
+        if len(self._entropy_cache) > 2000:
+            self._entropy_cache.clear()
+        self._entropy_cache[path] = (now, val)
+        return val
 
     def _evaluate_rules(self, evt: FileEvent) -> Tuple[List[str], Dict]:
         triggered = []
@@ -147,13 +171,18 @@ class Detector:
             # Only check files likely to be data files, skip tiny files
             size = evt.file_size or 0
             if size > 512 or ext in config.SUSPICIOUS_EXTENSIONS:
-                entropy = file_entropy(target)
+                entropy = self._cached_entropy(target)
                 if entropy >= config.ENTROPY_THRESHOLD:
                     triggered.append("HIGH_ENTROPY")
                     evidence["HIGH_ENTROPY"] = (
                         f"Entropy {entropy:.3f} >= {config.ENTROPY_THRESHOLD} "
                         f"in {os.path.basename(target)}"
                     )
+
+        # Rule 5 — Known suspect process name (fires immediately on EXE spawn)
+        if evt.process_name and evt.process_name.lower() in config.SUSPECT_PROCESS_NAMES:
+            triggered.append("SUSPECT_PROCESS")
+            evidence["SUSPECT_PROCESS"] = f"Known malware EXE: {evt.process_name}"
 
         return triggered, evidence
 
@@ -176,7 +205,7 @@ class Detector:
             offending_pid=evt.pid,
             offending_process=evt.process_name or "unknown",
             evidence=evidence,
-            severity="HIGH" if len(triggered) >= 2 else "MEDIUM",
+            severity="HIGH" if ("SUSPECT_PROCESS" in triggered or len(triggered) >= 2) else "MEDIUM",
         )
 
         self.stats["alerts_raised"] += 1
